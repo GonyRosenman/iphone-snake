@@ -80,6 +80,7 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def register_request(self, call_id, capability): pass
             def forget_request(self, call_id): pass
             def release_reference(self, config): return 'offline-fixture-reference'
+            def activate_call(self, call_id, attempt, fsync_directory): return None
             async def submit_phone_offer(self, attempt, rpc, params, deadline, *, authority):
                 await attempt.submit(rpc, params, startup_deadline=deadline,
                     observe_native=lambda thread, challenge: fixture.shared.NativeObservation(
@@ -169,6 +170,7 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def register_request(self, call_id, capability): pass
             def forget_request(self, call_id): pass
             def release_reference(self, config): return 'offline-fixture-reference'
+            def activate_call(self, call_id, attempt, fsync_directory): return None
             async def submit_phone_offer(self, attempt, rpc, params, deadline, *, authority):
                 await attempt.submit(rpc, params, startup_deadline=deadline,
                     observe_native=lambda thread, challenge: fixture.shared.NativeObservation(

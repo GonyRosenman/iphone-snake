@@ -1,7 +1,7 @@
 """A concrete phone-intent envelope and validator, NOT an admission grant.
 
-Canonical NativeAttempt does not yet accept this authority. Only a reviewed
-coordinator/shared API extension may turn it into a one-submission permission.
+The canonical phone API accepts these claims only alongside a trusted typed
+verifier and durable consumption; matching claims alone are never permission.
 """
 import hashlib
 import json

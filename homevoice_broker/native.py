@@ -57,6 +57,7 @@ class ManagedNativeHost:
         self._submission_possible = False
         self._last_closed_call_id = None
         self.request_registry = self.release_store = None
+        self.active_authority = self._greeting_task = None
 
     def status(self):
         if self._held:
@@ -137,6 +138,7 @@ class ManagedNativeHost:
         self._cleanup_deadline = None
         self._cleanup_requested = self._submission_possible = False
         self._coordinator_task = self._cleanup_task = self._late_task = None
+        self.active_authority = self._greeting_task = None
         self.answer = asyncio.get_running_loop().create_future()
         try:
             self._load_coordinator().register_request(call_id, request_capability)
@@ -162,6 +164,7 @@ class ManagedNativeHost:
                 self.attempt, self.rpc, params, deadline, authority=intent))
             await asyncio.wait_for(asyncio.shield(self._coordinator_task), self._remaining(deadline))
             await asyncio.wait_for(asyncio.shield(self.answer), self._remaining(deadline))
+            self.active_authority = self._load_coordinator().activate_call(call_id, self.attempt, runtime.fsync_directory)
             self.timer = asyncio.create_task(self._limit())
             return {"callID": call_id, "sdp": self.answer.result(), "model": MODEL}
         except BaseException:
@@ -173,6 +176,16 @@ class ManagedNativeHost:
             else:
                 self._refuse_before_submit()
             raise
+
+    async def peer_connected(self, call_id, control_id):
+        if (call_id != self.call_id or self.active_authority is None or self._held
+                or self._cleanup_requested or self._greeting_task is not None
+                or self.answer is None or not self.answer.done()):
+            raise NativeUnavailable('No unused owned active-call greeting authority')
+        self._greeting_task = asyncio.create_task(self.active_authority.greet(self.rpc, control_id))
+        result = await asyncio.shield(self._greeting_task)
+        self._emit('greeting.acknowledged')
+        return result
 
     def _refuse_before_submit(self):
         """No start was submitted. A failed durability repair still retains the lock."""
@@ -275,6 +288,14 @@ class ManagedNativeHost:
                 self._cleanup_task = asyncio.create_task(self.attempt.close(self.rpc, cleanup_deadline=deadline))
             if self._coordinator_task and not self._coordinator_task.done():
                 await asyncio.wait_for(asyncio.shield(self._coordinator_task), self._remaining(deadline))
+            # A timed-out greeting can still have an in-flight RPC worker. Drain
+            # both tasks before release; errors are settled, pending work is not.
+            greeting_tasks = [self._greeting_task,
+                getattr(self.active_authority, 'dispatch_task', None)]
+            for task in greeting_tasks:
+                if task is not None:
+                    await asyncio.wait_for(asyncio.gather(asyncio.shield(task), return_exceptions=True),
+                                           self._remaining(deadline))
             if self.attempt.start_requested and not self.attempt.closed_event.is_set():
                 timeout = self._remaining(deadline)
                 await asyncio.wait_for(self.attempt.closed_event.wait(), timeout)

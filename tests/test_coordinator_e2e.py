@@ -23,6 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from homevoice_broker.native import ManagedNativeHost, NativeUnavailable
 from homevoice_broker.server import create_app
 from homevoice_broker.trusted import RootReleaseStore, RequestCapability, TrustError, encoded, sha
+from homevoice_broker.coordinator import GREETING, GREETING_SHA256
 
 SHARED = os.environ.get('HOMEVOICE_SHARED_SOURCE')
 SECRET = 'offline-only-pairing-fixture-not-an-account-token'
@@ -42,6 +43,8 @@ class CoordinatorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.slots = []; self.calls = []; self.rpc_objects = []
         self.resume_entered = asyncio.Event(); self.resume_gate = threading.Event()
         self.block_resume = False
+        self.block_speech = False
+        self.speech_entered = asyncio.Event();self.speech_gate = threading.Event()
         self.loop = asyncio.get_running_loop()
         fixture = self
         class TemporaryCanonicalSlot(self.shared.ProjectSlot):
@@ -59,6 +62,9 @@ class CoordinatorEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     fixture.loop.call_soon_threadsafe(fixture.resume_entered.set)
                     if not fixture.resume_gate.wait(2): raise RuntimeError('Fixture resume barrier expired')
                 fixture.calls.append((method, params))
+                if method == 'thread/realtime/appendSpeech' and fixture.block_speech:
+                    fixture.loop.call_soon_threadsafe(fixture.speech_entered.set)
+                    if not fixture.speech_gate.wait(2):raise RuntimeError('Fixture speech barrier expired')
                 if method == 'account/read': return {'account': {'type': 'chatgpt'}}
                 if method == 'thread/realtime/start':
                     self.notify('thread/realtime/started', {'threadId': fixture.thread,
@@ -94,6 +100,7 @@ class CoordinatorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
     async def asyncTearDown(self):
         self.resume_gate.set()
+        self.speech_gate.set()
         for task in self.pending:
             if not task.done(): task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -115,6 +122,142 @@ class CoordinatorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.control_id = (await self.ws.receive_json())['connectionID']
     def offer(self):return {'callID':str(uuid.uuid4()).upper(),'sdp':'v=0\r\no=offline-offer','controlID':self.control_id}
     def native_starts(self):return [p for m,p in self.calls if m=='thread/realtime/start']
+    def speeches(self):return [p for m,p in self.calls if m=='thread/realtime/appendSpeech']
+    async def begin_greeting_call(self, *, scoped=True):
+        if scoped:
+            # Generated private fixture only, never a production release/pin.
+            self.release['greeting']={'owner_ref':'main-tg-1532','text_sha256':GREETING_SHA256,'max_operations':1}
+            self.write_release();self.releases.expected_sha256=sha(self.release_path.read_bytes())
+        await self.control();offer=self.offer()
+        response=await self.client.post('/v1/calls',json=offer,headers=self.headers)
+        self.assertEqual(response.status,201)
+        return offer
+    async def report_peer(self, offer):
+        await self.ws.send_json({'type':'peer.connected','callID':offer['callID']})
+    async def event(self, kind):
+        async with asyncio.timeout(2):
+            while True:
+                value=await self.ws.receive_json()
+                if value['type']==kind or (isinstance(kind,tuple) and value['type'] in kind):return value
+    def hold_greeting_dispatch(self):
+        original=self.host.active_authority.assert_owned
+        entered=asyncio.Event();gate=threading.Event()
+        def hold():
+            if threading.current_thread() is not threading.main_thread():
+                self.loop.call_soon_threadsafe(entered.set)
+                if not gate.wait(2):raise RuntimeError('Fixture dispatch barrier expired')
+            return original()
+        self.host.active_authority.assert_owned=hold
+        self.addCleanup(gate.set)
+        return entered,gate
+
+    async def test_speak_first_once_after_peer_report_without_owner_audio(self):
+        # Mutation: speak before peer report, appendText instead of appendSpeech,
+        # accept duplicate reports, or allow caller-provided text.
+        offer=await self.begin_greeting_call()
+        self.assertEqual(self.speeches(),[])
+        self.assertEqual(list(self.slot_path.glob('phone-greeting-*.json')),[])
+        await self.report_peer(offer);await self.event('greeting.acknowledged')
+        self.assertEqual(self.speeches(),[{'threadId':self.thread,'text':GREETING}])
+        self.assertEqual(len(self.native_starts()),1)
+        self.assertEqual(len(list(self.slot_path.glob('phone-greeting-*.json'))),1)
+        state=json.loads((self.slot_path/'voice-owner.json').read_text())
+        self.assertTrue(state['phone_greeting_rpc_acknowledged'])
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(len(self.speeches()),1)
+    async def test_greeting_requires_explicit_root_speech_scope(self):
+        offer=await self.begin_greeting_call(scoped=False)
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(self.speeches(),[])
+    async def test_early_peer_report_before_owned_sdp_cannot_speak(self):
+        await self.control();self.block_resume=True;offer=self.offer()
+        start=asyncio.create_task(self.client.post('/v1/calls',json=offer,headers=self.headers));self.pending.append(start)
+        await asyncio.wait_for(self.resume_entered.wait(),2)
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(self.speeches(),[])
+        self.resume_gate.set();self.assertEqual((await start).status,201)
+    async def test_wrong_call_or_arbitrary_speech_payload_is_rejected(self):
+        offer=await self.begin_greeting_call()
+        await self.ws.send_json({'type':'peer.connected','callID':offer['callID'],'text':'untrusted speech'})
+        async with asyncio.timeout(2):
+            while not self.ws.closed:await self.ws.receive()
+        self.assertEqual(self.speeches(),[])
+    async def test_wrong_call_peer_report_never_speaks(self):
+        await self.begin_greeting_call()
+        await self.ws.send_json({'type':'peer.connected','callID':str(uuid.uuid4())})
+        async with asyncio.timeout(2):
+            while not self.ws.closed:await self.ws.receive()
+        self.assertEqual(self.speeches(),[])
+    async def test_foreign_control_cannot_report_owned_peer(self):
+        offer=await self.begin_greeting_call()
+        other=await self.client.ws_connect('/v1/events',headers=self.headers)
+        await other.receive_json()
+        await other.send_json({'type':'peer.connected','callID':offer['callID']})
+        async with asyncio.timeout(2):
+            while not other.closed:await other.receive()
+        self.assertEqual(self.speeches(),[])
+        # Closing an unrelated control must leave the actual owner's call alive.
+        self.assertEqual(self.host.call_id,offer['callID'])
+        await self.report_peer(offer);await self.event('greeting.acknowledged')
+        self.assertEqual(len(self.speeches()),1)
+    async def test_greeting_persistence_failure_never_dispatches_or_replays(self):
+        offer=await self.begin_greeting_call()
+        def fail(_):raise OSError('Injected greeting durability failure')
+        self.host.active_authority.fsync_directory=fail
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(self.speeches(),[])
+        self.assertEqual(len(list(self.slot_path.glob('phone-greeting-*.json'))),1)
+    async def test_timed_out_greeting_worker_must_drain_before_slot_release(self):
+        # Mutation: drain only the greeting coroutine, omit its surviving worker.
+        offer=await self.begin_greeting_call();self.block_speech=True
+        # Advance both greeting clocks consistently near the ONE original expiry.
+        advanced=lambda:time.monotonic()+9.9
+        self.host.request_registry.clock=advanced
+        with patch('homevoice_broker.coordinator.monotonic',side_effect=advanced):
+            await self.report_peer(offer);await asyncio.wait_for(self.speech_entered.wait(),2)
+            await self.event('greeting.unavailable')
+        self.assertTrue(self.host._greeting_task.done())
+        self.assertFalse(self.host.active_authority.dispatch_task.done())
+        close=await self.client.post('/v1/calls/close',json={'callID':offer['callID']},headers=self.headers)
+        self.assertEqual(await close.json(),{'closed':False})
+        self.assertTrue(self.host._held);self.assertIsNotNone(self.host.slot.handle)
+        self.speech_gate.set()
+        await asyncio.gather(self.host.active_authority.dispatch_task,return_exceptions=True)
+    async def test_foreign_native_started_never_receives_greeting(self):
+        offer=await self.begin_greeting_call()
+        self.host._notification('thread/realtime/started',{'threadId':self.thread,'realtimeSessionId':str(uuid.uuid4())})
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(self.speeches(),[])
+        self.assertEqual([m for m,_ in self.calls if m=='thread/realtime/stop'],[])
+    async def test_expired_greeting_does_not_receive_fresh_budget(self):
+        offer=await self.begin_greeting_call()
+        self.host.request_registry.clock=lambda:time.monotonic()+11
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        await self.report_peer(offer);await self.event('greeting.unavailable')
+        self.assertEqual(self.speeches(),[])
+    async def test_disconnect_revokes_pending_greeting_before_dispatch(self):
+        offer=await self.begin_greeting_call();entered,gate=self.hold_greeting_dispatch()
+        await self.report_peer(offer);await asyncio.wait_for(entered.wait(),2)
+        await self.ws.close();gate.set()
+        await asyncio.gather(self.host._greeting_task,return_exceptions=True)
+        self.assertEqual(self.speeches(),[])
+    async def test_end_revokes_pending_greeting_before_dispatch(self):
+        offer=await self.begin_greeting_call();entered,gate=self.hold_greeting_dispatch()
+        await self.report_peer(offer);await asyncio.wait_for(entered.wait(),2)
+        revoked=asyncio.Event();original=self.host.request_registry.revoke_request
+        def observe(capability):original(capability);revoked.set()
+        self.host.request_registry.revoke_request=observe
+        close=asyncio.create_task(self.client.post('/v1/calls/close',json={'callID':offer['callID']},headers=self.headers));self.pending.append(close)
+        await asyncio.wait_for(revoked.wait(),2);gate.set()
+        self.assertEqual(await (await close).json(),{'closed':True})
+        self.assertEqual(self.speeches(),[])
+    async def test_root_revocation_blocks_pending_greeting_at_dispatch(self):
+        offer=await self.begin_greeting_call();entered,gate=self.hold_greeting_dispatch()
+        await self.report_peer(offer);await asyncio.wait_for(entered.wait(),2)
+        self.release['enabled']=False;self.write_release();gate.set()
+        result=await self.event(('greeting.unavailable','greeting.acknowledged'))
+        self.assertEqual(result['type'],'greeting.unavailable');self.assertEqual(self.speeches(),[])
     async def test_real_capability_and_fixture_release_reach_one_canonical_start(self):
         await self.control(); offer=self.offer()
         response=await self.client.post('/v1/calls',json=offer,headers=self.headers)

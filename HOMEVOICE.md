@@ -22,6 +22,11 @@ The native interface may change; qualified shared source hashes are required.
 - An authenticated home SDP/control broker that receives no audio. It cannot
   accept arbitrary agent IDs, commands, model choices or provider URLs from the
   phone. Failed or uncertain admission is not retried automatically.
+- One fixed Hebrew speak-first greeting after the app reports remote SDP applied
+  and its WebRTC peer connected. No microphone input/unmute is required to trigger
+  speech. A separate server-owned active-call capability and explicit root speech
+  scope guard this one operation; End/disconnect revoke pending speech. A speech
+  RPC acknowledgment does not prove generated audio or owner hearing.
 - A native adapter that imports the existing canonical `ProjectSlot` and
   `NativeAttempt` lifecycle in place, instead of creating competing ownership.
   Native Codex owns handoffs; the phone never dispatches a duplicate backend task.

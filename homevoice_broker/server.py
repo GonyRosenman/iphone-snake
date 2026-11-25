@@ -109,7 +109,22 @@ class Broker:
                 # Native audio/control events go directly to OpenAI/managed Codex.
                 # The phone cannot inject turn/start, provider URLs, thread IDs or commands.
                 if message.type == web.WSMsgType.TEXT:
-                    if message.data != 'ping': await ws.close(code=1008, message=b"Unsupported command")
+                    if message.data == 'ping': continue
+                    try: event = json.loads(message.data)
+                    except ValueError: event = None
+                    if (not isinstance(event, dict) or set(event) != {'type','callID'}
+                            or event.get('type') != 'peer.connected' or event.get('callID') != self.current
+                            or self.current_control != control_id):
+                        await ws.close(code=1008, message=b"Unsupported control event")
+                        continue
+                    async def greet(identifier=event['callID']):
+                        try: await self.host.peer_connected(identifier, control_id)
+                        except Exception:
+                            if not ws.closed:
+                                try: await ws.send_json({'type':'greeting.unavailable','callID':identifier})
+                                except ConnectionError: pass
+                    task = asyncio.create_task(greet())
+                    self.tasks.add(task); task.add_done_callback(self.tasks.discard)
         finally:
             self.registry.revoke_control(control_id)
             self.sockets.pop(control_id, None)

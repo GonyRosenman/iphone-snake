@@ -87,6 +87,41 @@ built-in coordinator/trusted-registry sources. The real configuration stays
 `enabled=false`; no private source pins or custody releases are refreshed by
 source integration or tests. No provider fallback, retry or public exposure.
 
+## One speak-first greeting after admission
+
+After exact owned Started and SDP answer, the coordinator promotes the real POST
+capability into a distinct opaque active-call capability before the HTTP request
+ends. This authority remains tied to the same live authenticated control socket,
+call/device/native nonce and consumed root release. It cannot authorize a new
+start and does not depend on the ended POST AuthContext. One ten-second monotonic
+greeting deadline is established at promotion; reports/retries cannot reset it.
+
+After remote SDP is applied and aggregate WebRTC peer state becomes connected,
+the iPhone sends only `{type:"peer.connected",callID:...}` on its existing
+control WebSocket. The broker binds the message to that actual socket; callers
+cannot supply text, model, thread, native nonce, device identity or commands.
+This is a paired-client connection report, not independent media/hearing proof.
+No microphone PCM/unmute is needed to trigger the greeting.
+
+The root-issued manifest must additionally contain an exact `greeting` scope:
+`owner_ref` main-tg-1532, static server greeting `text_sha256`, and integer
+`max_operations` one. Without this explicit scope, start may be authorized but
+speech refuses. No production grant is created by source/tests. After checking
+current root scope, owned live native session, no foreign/closing/error state,
+exact nonce/control and deadline, persist one exclusive0600/fsynced
+phone-greeting intent and record its digest in the canonical ledger before RPC.
+Only the fixed trusted server text is sent through the installed purpose-built
+`thread/realtime/appendSpeech` schema `{threadId,text}`. No appendText fallback,
+arbitrary caller speech, duplicate greeting or additional native start.
+
+Recheck all these gates at worker dispatch. End/disconnect revoke pending
+speech immediately. An already dispatched request cannot be recalled; cleanup
+must drain both the greeting coroutine and any still-running RPC worker under
+the original canonical close deadline before releasing. Unsettled work remains
+held. A failure or partial persistence consumes the greeting without replay.
+Greeting ACK, actual model output, owner hearing and backend handoff remain
+separate qualification results.
+
 ## Lifecycle and return path
 
 Subscribe before submission. An RPC response is not native admission. Match

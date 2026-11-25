@@ -21,6 +21,7 @@ EFFECT = 'one start; may retire stale voice on this exact backing thread only'
 class TrustError(RuntimeError): pass
 class AuthContext: pass
 class RequestCapability: pass
+class ActiveCallCapability: pass
 
 def encoded(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
@@ -39,6 +40,18 @@ class RequestRecord:
     operation: tuple | None = None
     submitting: bool = False
 
+@dataclass
+class ActiveCallRecord:
+    request: RequestCapability
+    call_id: str
+    native_nonce: str
+    device_binding: str
+    control_id: str
+    greeting_deadline: float
+    active: bool = True
+    connected: bool = False
+    greeting_requested: bool = False
+
 class RequestRegistry:
     def __init__(self, device_binding, *, clock=time.monotonic):
         self.device_binding = device_binding
@@ -47,6 +60,7 @@ class RequestRegistry:
         self.auth = {}
         self.controls = {}
         self.requests = {}
+        self.active_calls = {}
 
     def authenticated(self):
         # Called by trusted middleware only AFTER constant-time pairing auth.
@@ -68,6 +82,8 @@ class RequestRegistry:
         with self.lock:
             self.controls.pop(identifier, None)
             for record in self.requests.values():
+                if record.control_id == identifier: record.active = False
+            for record in self.active_calls.values():
                 if record.control_id == identifier: record.active = False
 
     def issue_request(self, context, call_id, sdp, control_id):
@@ -127,6 +143,48 @@ class RequestRegistry:
     def revoke_request(self, capability):
         with self.lock:
             if capability in self.requests: self.requests[capability].active = False
+            for record in self.active_calls.values():
+                if record.request is capability: record.active = False
+
+    def activate_call(self, capability, binding):
+        """Promote the real POST capability before its HTTP lifetime ends.
+
+        The active capability depends on the live authenticated control channel,
+        not the expired POST AuthContext, and cannot authorize another start.
+        """
+        with self.lock:
+            self.verify_operation(capability, binding)
+            record = self.requests[capability]
+            if not record.submitting: raise TrustError('Native submission required before call activation')
+            active = ActiveCallCapability()
+            self.active_calls[active] = ActiveCallRecord(capability, binding.call_id,
+                binding.native_nonce, binding.device_binding, record.control_id, self.clock()+10)
+            return active
+
+    def assert_active_call(self, capability, binding):
+        with self.lock:
+            record = self.active_calls.get(capability) if type(capability) is ActiveCallCapability else None
+            if record is None: raise TrustError('Unknown active-call capability')
+            control = self.controls.get(record.control_id)
+            if (not record.active or not control or control[0] not in self.auth or control[1].closed
+                    or self.clock() >= record.greeting_deadline or record.call_id != binding.call_id
+                    or record.native_nonce != binding.native_nonce or record.device_binding != binding.device_binding):
+                raise TrustError('Active call/control identity expired or revoked')
+            return record
+
+    def report_connected(self, capability, binding, control_id):
+        with self.lock:
+            record = self.assert_active_call(capability, binding)
+            if record.control_id != control_id: raise TrustError('Peer report belongs to another control')
+            record.connected = True  # Paired client report, NOT independent media/hearing proof.
+
+    def begin_greeting(self, capability, binding):
+        with self.lock:
+            record = self.assert_active_call(capability, binding)
+            if not record.connected or record.greeting_requested:
+                raise TrustError('Connected unused greeting authority required')
+            record.greeting_requested = True
+            return record
 
 
 class RootReleaseStore:
@@ -163,11 +221,11 @@ class RootReleaseStore:
         required = {'version','enabled','owner_ref','frontend','release_ref','thread_id','model',
                     'device_binding','requested_effect','not_before','expires_at','max_operations'}
         now = self.wall_clock()
-        if type(release) is not dict or set(release) != required:
+        if type(release) is not dict or set(release) not in (required, required|{'greeting'}):
             raise TrustError('Malformed root release state')
         if any(type(release[name]) not in (int,float) or not math.isfinite(release[name]) for name in ('not_before','expires_at')):
             raise TrustError('Finite root release validity required')
-        if (set(release) != required or type(release['version']) is not int or release['version'] != 1
+        if (type(release['version']) is not int or release['version'] != 1
                 or release['enabled'] is not True or release['owner_ref'] != OWNER_REF
                 or release['frontend'] != 'homevoice' or release['thread_id'] != thread
                 or release['model'] != MODEL or release['device_binding'] != device
@@ -209,3 +267,11 @@ class RootReleaseStore:
             expected = {'root_release_sha256': digest, 'binding': asdict(binding),
                         'intent_sha256': intent_sha256, 'request_evidence_sha256': request_evidence_sha256}
             if raw != encoded(expected): raise TrustError('Root consumption binding changed')
+
+    def assert_greeting(self, binding, intent_sha256, request_evidence_sha256, text_sha256):
+        self.assert_claim(binding, intent_sha256, request_evidence_sha256)
+        release, _, _ = self.inspect(thread=binding.thread_id, device=binding.device_binding)
+        scope = release.get('greeting')
+        if (scope != {'owner_ref':'main-tg-1532', 'text_sha256':text_sha256, 'max_operations':1}
+                or type(scope.get('max_operations')) is not int):
+            raise TrustError('Root release does not include this bounded speak-first greeting')

@@ -100,7 +100,10 @@ final class VoicePeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelega
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        onConnected?(newState == .connected || newState == .completed)
+        if newState == .failed { onFailure?() }
+    }
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
+        onConnected?(newState == .connected)
         if newState == .failed { onFailure?() }
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
@@ -135,6 +138,8 @@ final class VoiceModel: ObservableObject {
     private var peer: VoicePeer?
     private var callID: String?
     private var controlID: String?
+    private var remoteAnswerApplied = false
+    private var greetingReported = false
     private var socket: URLSessionWebSocketTask?
     private var socketReader: Task<Void, Never>?
     private var maxDuration: Task<Void, Never>?
@@ -223,10 +228,24 @@ final class VoiceModel: ObservableObject {
         if event.type == "call.error" { cleanup(); ready = false; message = event.text ?? "השיחה נעצרה במחשב." }
         if event.type == "agent.working" { agentWorking = true }
         if event.type == "agent.done" { agentWorking = false }
+        if event.type == "greeting.unavailable" { message = "השיחה מחוברת, אך פתיחת הקול לא אושרה במחשב." }
+    }
+    private func reportPeerConnected(_ attempt: UUID) async {
+        guard epoch == attempt, active, remoteAnswerApplied, mediaConnected,
+              !greetingReported, let id = callID, let ws = socket else { return }
+        greetingReported = true
+        do {
+            let data = try JSONSerialization.data(withJSONObject: ["type":"peer.connected", "callID":id])
+            try await ws.send(.string(String(decoding: data, as: UTF8.self)))
+        } catch {
+            guard epoch == attempt else { return }
+            await stop(); message = "החיבור לבית נותק לפני תחילת השיחה."
+        }
     }
     func start() async {
         guard homeConnected, ready, let controlID = controlID, !busy, !active, !demo else { return }
         busy = true; let attempt = UUID(); epoch = attempt
+        remoteAnswerApplied = false; greetingReported = false
         message = "מכין שיחה…"
         defer { busy = false }
         do {
@@ -246,7 +265,7 @@ final class VoiceModel: ObservableObject {
             rtc.onConnected = { [weak self] connected in Task { @MainActor in
                 guard let self = self, self.epoch == attempt else { return }
                 self.mediaConnected = connected
-                if connected { self.message = "אפשר לדבר" }
+                if connected { self.message = "אפשר לדבר"; await self.reportPeerConnected(attempt) }
             } }
             let sdp = try await rtc.offer()
             guard epoch == attempt else { rtc.close(); return }
@@ -257,8 +276,12 @@ final class VoiceModel: ObservableObject {
                 throw VoiceError.message("המחשב החזיר חיבור קולי לא צפוי.")
             }
             try await rtc.answer(answer.sdp)
+            guard epoch == attempt else { rtc.close(); return }
+            remoteAnswerApplied = true
             active = true; finishing = false; muted = false; userCaption = ""; agentCaption = ""
             message = "מתחבר לשיחה…"
+            await reportPeerConnected(attempt)
+            guard epoch == attempt else { return }
             maxDuration = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 300_000_000_000)
                 if !Task.isCancelled { await self?.stop() }
@@ -297,6 +320,7 @@ final class VoiceModel: ObservableObject {
         epoch = UUID(); maxDuration?.cancel(); maxDuration = nil
         peer?.close(); peer = nil; callID = nil
         active = false; mediaConnected = false; muted = false; finishing = false; agentWorking = false
+        remoteAnswerApplied = false; greetingReported = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
