@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "pairing_secret_file": "/private/path/homevoice-pairing-secret",
+  "shared_voice_directory": "/private/path/existing-agent-voice",
+  "lifecycle_sha256": "REVIEWED_CANONICAL_SOURCE_SHA256",
+  "peerbridge_directory": "/private/path/existing-peerbridge",
+  "thread_id": "OWNER_APPROVED_SAVED_HOME_AGENT_ID",
+  "coordinator_file": "/private/path/reviewed-phone-admission-coordinator.py",
+  "coordinator_sha256": "REVIEWED_COORDINATOR_SHA256"
+}

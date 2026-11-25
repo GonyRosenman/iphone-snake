@@ -1,0 +1,61 @@
+name: HomeVoice native app
+on:
+  push:
+    branches: [main]
+    paths: ['HomeVoice/**', 'HomeVoice.xcodeproj/**', 'homevoice/**', 'tests/**', 'Tests/HomeVoiceChecks.swift', 'scripts/homevoice-smoke.sh', '.github/workflows/homevoice.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: homevoice-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record tools and check protocol
+        run: |
+          mkdir -p build
+          xcodebuild -version
+          swiftc HomeVoice/LiveProtocol.swift Tests/HomeVoiceChecks.swift -o build/homevoice-checks
+          build/homevoice-checks
+          python3 -m venv build/test-env
+          build/test-env/bin/pip install -r homevoice/requirements.txt
+          build/test-env/bin/python -m unittest discover -s tests -v
+      - name: Build native iPhone app
+        run: |
+          set -o pipefail
+          xcodebuild -project HomeVoice.xcodeproj -scheme HomeVoice -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/homevoice-device CODE_SIGNING_ALLOWED=NO build | tee build/homevoice-device.log
+          mkdir -p build/homevoice-package/Payload
+          cp -R build/homevoice-device/Build/Products/Release-iphoneos/HomeVoice.app build/homevoice-package/Payload/
+          (cd build/homevoice-package && zip -qr ../HomeVoice-unsigned.ipa Payload)
+          shasum -a 256 build/HomeVoice-unsigned.ipa > build/HomeVoice-SHA256SUMS.txt
+      - name: Publish unsigned native app
+        uses: actions/upload-artifact@v4
+        with:
+          name: HomeVoice-unsigned-${{ github.sha }}
+          path: |
+            build/HomeVoice-unsigned.ipa
+            build/HomeVoice-SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Build simulator app
+        run: |
+          set -o pipefail
+          xcodebuild -project HomeVoice.xcodeproj -scheme HomeVoice -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build/homevoice-simulator CODE_SIGNING_ALLOWED=NO build | tee build/homevoice-simulator.log
+      - name: Launch simulator preview without microphone or network
+        timeout-minutes: 6
+        run: bash scripts/homevoice-smoke.sh
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HomeVoice-evidence-${{ github.sha }}
+          path: |
+            build/homevoice-*.log
+            build/homevoice-*.png
+            build/homevoice-launch.txt
+          if-no-files-found: error
+          retention-days: 1

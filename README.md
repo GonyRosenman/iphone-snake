@@ -38,3 +38,9 @@ credentials, provisioning profiles or device identifiers.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## HomeVoice
+
+The separate [HomeVoice app](HOMEVOICE.md) adds a native voice interface to an
+existing home agent. Its build, pairing and runtime qualification are tracked
+separately from the Snake proof.

@@ -10,3 +10,10 @@ xcuserdata/
 *.p12
 *.mobileprovision
 *.p8
+.venv-homevoice/
+.runtime/
+__pycache__/
+*.pyc
+homevoice-config.json
+*.pem
+*.key

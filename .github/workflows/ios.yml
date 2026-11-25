@@ -2,6 +2,7 @@ name: Native iOS build
 on:
   push:
     branches: [main]
+    paths: ['TinySnake/**', 'TinySnake.xcodeproj/**', 'Tests/GameChecks.swift', 'scripts/simulator-smoke.sh', '.github/workflows/ios.yml']
   workflow_dispatch:
 permissions:
   contents: read
