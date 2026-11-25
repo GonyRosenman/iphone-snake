@@ -1,0 +1,12 @@
+PROJECT_CONTEXT.md
+OWNER*.json
+private/
+*.oga
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+*.p12
+*.mobileprovision
+*.p8

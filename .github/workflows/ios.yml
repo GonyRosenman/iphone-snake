@@ -1,0 +1,54 @@
+name: Native iOS build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record Xcode and SDK versions
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+      - name: Check game behavior
+        run: |
+          mkdir -p build
+          swiftc TinySnake/Game.swift Tests/GameChecks.swift -o build/game-checks
+          build/game-checks
+      - name: Build iPhone Simulator app
+        run: |
+          set -o pipefail
+          xcodebuild -project TinySnake.xcodeproj -scheme TinySnake -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build/simulator CODE_SIGNING_ALLOWED=NO build | tee build/simulator-build.log
+      - name: Launch in iPhone Simulator
+        run: bash scripts/simulator-smoke.sh
+      - name: Build unsigned native iPhone app
+        run: |
+          set -o pipefail
+          xcodebuild -project TinySnake.xcodeproj -scheme TinySnake -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO build | tee build/device-build.log
+          mkdir -p build/package/Payload
+          cp -R build/device/Build/Products/Release-iphoneos/TinySnake.app build/package/Payload/
+          (cd build/package && zip -qr ../TinySnake-unsigned.ipa Payload)
+          shasum -a 256 build/TinySnake-unsigned.ipa > build/SHA256SUMS.txt
+          printf 'Native arm64 IPA built without signing. Requires local signing/provisioning before installation.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve build outputs and simulator evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TinySnake-build-${{ github.sha }}
+          path: |
+            build/TinySnake-unsigned.ipa
+            build/SHA256SUMS.txt
+            build/*.log
+            build/simulator.png
+            build/simulator-launch.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
