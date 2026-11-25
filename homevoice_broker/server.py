@@ -6,6 +6,7 @@ not expose a public port, alter a firewall, install a service or mint OAuth.
 import argparse
 import asyncio
 import hmac
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -56,7 +57,7 @@ class Broker:
                 if not any(not ws.closed for ws in self.sockets):
                     self.current = None
                     raise NativeUnavailable("Home control disconnected before admission")
-                result = await self.host.start(identifier, sdp, self.publish)
+                result = await self.host.start(identifier, sdp, self.publish, device_binding=request["device_binding"])
             # Native signaling is not a credential-export surface.
             if set(result) != {"callID", "sdp", "model"}:
                 raise NativeUnavailable("Unexpected signaling fields")
@@ -125,6 +126,7 @@ def create_app(secret, host):
     async def authenticate(request, handler):
         if request.headers.get("Origin") or not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + secret):
             raise web.HTTPUnauthorized(text="Unauthorized")
+        request["device_binding"] = hashlib.sha256(secret.encode()).hexdigest()
         return await handler(request)
     app = web.Application(middlewares=[authenticate], client_max_size=65536)
     broker = Broker(host)

@@ -34,7 +34,7 @@ rendering and offline HTTP tests.
 
 The broker is **disabled by default**. A reviewed local coordinator must supply
 `readiness(config)` and async `submit_phone_offer(attempt, rpc, params,
-startup_deadline)` before native admission can run. The coordinator owns the
+startup_deadline, authority=...)` before native admission can run. The coordinator owns the
 fresh shared-slot admission decision. This code never borrows an old probe's
 retirement grant, calls `thread/read` an empty-slot oracle, or starts another
 backing thread. The existing runtime custodian must review and release this
@@ -87,3 +87,27 @@ Native integration follows the matching installed Codex source:
 The public [Live WebRTC guide](https://developers.openai.com/api/docs/guides/voice-webrtc)
 explains direct media versus server signaling, but its API-key/session creation
 contract is a different transport from the managed native route implemented here.
+
+
+## Shared admission review contract
+
+See [the concrete phone-intent proposal](homevoice_broker/ADMISSION_CONTRACT.md).
+This is source/contract work; it does not extend the canonical lifecycle API or
+release the existing native session slot.
+
+Optional tests against the existing canonical lifecycle source:
+
+```sh
+HOMEVOICE_SHARED_SOURCE=/private/path/existing-agent-voice \
+  .venv-homevoice/bin/python -W error::RuntimeWarning -m unittest discover -s tests -v
+```
+
+These use the actual ManagedNativeHost and canonical locking/lifecycle methods,
+but an explicit temporary slot and fake RPC. They acquire no production lock
+and make no native/provider calls. CI without the external canonical source
+reports those cases skipped. A skipped integration case is not runtime evidence.
+
+The device IPA check reads actual Mach-O dependencies/runpaths and the embedded
+framework. Successful compilation alone cannot establish that a dynamic
+framework can load. Simulator preview remains different from physical-phone
+microphone, playback, interruption, network and backend execution qualification.

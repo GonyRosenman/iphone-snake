@@ -20,7 +20,7 @@ class FixtureHost:
         self.stops = []
         self.confirm_close = True
     def status(self): return {"ready": True, "message": "offline fixture"}
-    async def start(self, call_id, sdp, publish):
+    async def start(self, call_id, sdp, publish, *, device_binding):
         self.starts += 1; self.call_id = call_id; self.publish = publish
         return {"callID": call_id, "sdp": "v=0\r\no=offline-answer", "model": "gpt-live-1.1-codex"}
     async def close(self, call_id):
@@ -96,7 +96,7 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_native_host_does_not_load_coordinator_or_rpc(self):
         host = ManagedNativeHost({'enabled': False})
         self.assertFalse(host.status()['ready'])
-        with self.assertRaises(NativeUnavailable): await host.start(str(uuid.uuid4()), 'v=0', lambda e: None)
+        with self.assertRaises(NativeUnavailable): await host.start(str(uuid.uuid4()), 'v=0', lambda e: None, device_binding='0'*64)
         self.assertIsNone(host.rpc); self.assertIsNone(host.slot)
 
 class NativeContractTests(unittest.TestCase):
@@ -122,9 +122,9 @@ class ConcurrentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         class SlowHost(FixtureHost):
             def __init__(self):
                 super().__init__(); self.entered = asyncio.Event(); self.release = asyncio.Event()
-            async def start(self, call_id, sdp, publish):
+            async def start(self, call_id, sdp, publish, *, device_binding):
                 self.entered.set(); await self.release.wait()
-                return await super().start(call_id, sdp, publish)
+                return await super().start(call_id, sdp, publish, device_binding=device_binding)
         host = SlowHost()
         client = TestClient(TestServer(create_app(SECRET, host)))
         await client.start_server()
@@ -142,3 +142,20 @@ class ConcurrentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await (await close).json(), {'closed': True})
         self.assertEqual(host.stops, [identifier])
         await ws.close(); await client.close()
+
+
+class NativeProjectionTests(unittest.TestCase):
+    def test_transcript_items_are_not_backend_work(self):
+        from types import SimpleNamespace
+        host = ManagedNativeHost({"enabled": False, "thread_id": "fixed-home-agent"})
+        host.call_id = "offline-call"
+        host.attempt = SimpleNamespace(admitted=True)
+        events = []
+        host.publish = events.append
+        host._notification("thread/realtime/item/started", {"threadId": "fixed-home-agent"})
+        self.assertEqual(events, [])
+        host._notification("turn/started", {"threadId": "foreign-agent"})
+        self.assertEqual(events, [])
+        host._notification("turn/started", {"threadId": "fixed-home-agent"})
+        host._notification("turn/completed", {"threadId": "fixed-home-agent"})
+        self.assertEqual([event["type"] for event in events], ["agent.working", "agent.done"])

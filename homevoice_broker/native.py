@@ -39,24 +39,25 @@ class NativeUnavailable(RuntimeError):
 
 
 class ManagedNativeHost:
-    """Imports the canonical lock/attempt; requires reviewed coordinator injection.
+    """Managed signaling; admission still belongs to the reviewed coordinator.
 
-    The coordinator module must expose readiness(config) and async
-    submit_phone_offer(attempt, rpc, params, startup_deadline). It owns fresh
-    admission evidence/authority. This adapter does NOT reuse a historic
-    retirement grant or infer vacancy from thread/read or a closed file.
+    runtime_factory is an in-process test seam, never an HTTP/config option.
+    No runtime object, slot or RPC is created by import/status when disabled.
     """
-    def __init__(self, config):
+    def __init__(self, config, *, runtime_factory=None, cleanup_seconds=10):
         self.config = config
-        self.call_id = None
-        self.rpc = self.slot = self.attempt = None
-        self.publish = None
-        self.answer = None
-        self.coordinator = None
-        self.timer = None
-        self._coordinator_task = None
-        self._closing = False
+        self.call_id = self.rpc = self.slot = self.attempt = None
+        self.publish = self.answer = self.coordinator = self.timer = None
+        self._runtime_factory = runtime_factory
+        self._coordinator_task = self._late_task = None
+        self._cleanup_task = None
+        self._cleanup_deadline = None
+        self._cleanup_requested = False
+        self._cleanup_seconds = cleanup_seconds
+        self._close_lock = asyncio.Lock()
         self._held = False
+        self._submission_possible = False
+        self._last_closed_call_id = None
 
     def status(self):
         if self._held:
@@ -66,9 +67,7 @@ class ManagedNativeHost:
         if self.config.get("enabled") is not True:
             return {"ready": False, "message": "המחשב זמין. השירות הקולי ממתין להפעלה מאושרת."}
         try:
-            module = self._load_coordinator()
-            result = module.readiness(dict(self.config))
-            if result.get("ready") is not True:
+            if self._load_coordinator().readiness(dict(self.config)).get("ready") is not True:
                 return {"ready": False, "message": "השירות הקולי בבית עדיין אינו זמין."}
         except Exception:
             return {"ready": False, "message": "הגדרת החיבור הקולי במחשב דורשת בדיקה."}
@@ -78,80 +77,114 @@ class ManagedNativeHost:
         if self.coordinator is not None:
             return self.coordinator
         path = Path(self.config["coordinator_file"])
-        expected = self.config["coordinator_sha256"]
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != self.config["coordinator_sha256"]:
             raise NativeUnavailable("Reviewed coordinator identity is unavailable")
         spec = importlib.util.spec_from_file_location("homevoice_reviewed_coordinator", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         if not callable(getattr(module, "readiness", None)) or not callable(getattr(module, "submit_phone_offer", None)):
             raise NativeUnavailable("Coordinator contract is unavailable")
         self.coordinator = module
         return module
 
-    async def start(self, call_id, sdp, publish):
-        if self.call_id or self._held:
-            raise NativeUnavailable("Voice slot is occupied or unresolved")
-        if not self.status()["ready"]:
-            raise NativeUnavailable("Native admission has not been released")
-        coordinator = self._load_coordinator()
+    def _runtime(self):
+        if self._runtime_factory:
+            return self._runtime_factory()
+        from types import SimpleNamespace
         shared = Path(self.config["shared_voice_directory"]).resolve()
         lifecycle = shared / "voice_ownership.py"
         if hashlib.sha256(lifecycle.read_bytes()).hexdigest() != self.config["lifecycle_sha256"]:
             raise NativeUnavailable("Shared lifecycle changed; reconcile before admission")
-        # Load the canonical implementation in place. Never copy it or use our own lock.
         sys.path.insert(0, str(shared))
-        from voice_ownership import ProjectSlot, NativeAttempt, fsync_directory
+        import voice_ownership
         from delegation_contract import THREAD
-        if THREAD != self.config["thread_id"]:
-            raise NativeUnavailable("The fixed backing identity changed")
+        if Path(voice_ownership.__file__).resolve() != lifecycle.resolve() or THREAD != self.config["thread_id"]:
+            raise NativeUnavailable("Canonical lifecycle/backing identity changed")
         sys.path.insert(0, str(Path(self.config["peerbridge_directory"]).resolve()))
         from cxrpc import CodexRPC
-        self.slot = ProjectSlot.for_project().acquire(require_previous_closed=True)
-        self.slot.assert_project_scope()
-        self.attempt = NativeAttempt(self.slot)
-        self.call_id, self.publish = call_id, publish
-        self.answer = asyncio.get_running_loop().create_future()
-        loop = asyncio.get_running_loop()
-        # An intent records one attempt; neither timeout nor reconnection replays it.
-        intent = {"frontend": "homevoice", "call_id": call_id, "nonce": self.slot.nonce,
-                  "thread_id": THREAD, "model": MODEL, "time": time.time(),
-                  "sdp_sha256": hashlib.sha256(sdp.encode()).hexdigest()}
-        import os
-        intent_path = self.slot.directory / ("phone-intent-" + self.slot.nonce + ".json")
-        with intent_path.open("x") as stream:
-            json.dump(intent, stream); stream.flush(); os.fsync(stream.fileno())
-        fsync_directory(self.slot.directory)
-        self.slot.write("reserved", frontend="homevoice", call_id=call_id)
+        return SimpleNamespace(ProjectSlot=voice_ownership.ProjectSlot, NativeAttempt=voice_ownership.NativeAttempt,
+                               rpc_factory=CodexRPC, thread=THREAD, fsync_directory=voice_ownership.fsync_directory)
 
-        def notify(method, params):
-            loop.call_soon_threadsafe(self._notification, method, params)
+    def _persist_intent(self, runtime, sdp, device_binding):
+        from .intent import make_intent, encode_intent
+        import os
+        intent = make_intent(call_id=self.call_id, nonce=self.slot.nonce, thread=runtime.thread,
+                             sdp=sdp, device_binding=device_binding,
+                             release_ref=self.config.get("runtime_release_ref"))
+        payload = encode_intent(intent)
+        path = self.slot.directory / ("phone-intent-" + self.slot.nonce + ".json")
+        with path.open("xb") as stream:
+            stream.write(payload); stream.flush(); os.fsync(stream.fileno())
+        runtime.fsync_directory(self.slot.directory)
+        self.slot.write("reserved", frontend="homevoice", call_id=self.call_id,
+                        phone_intent_sha256=hashlib.sha256(payload).hexdigest())
+        return intent
+
+    async def start(self, call_id, sdp, publish, *, device_binding):
+        if self.call_id or self._held:
+            raise NativeUnavailable("Voice slot is occupied or unresolved")
+        if not self.status()["ready"]:
+            raise NativeUnavailable("Native admission has not been released")
+        self.call_id, self.publish = call_id, publish
+        self._cleanup_deadline = None
+        self._cleanup_requested = self._submission_possible = False
+        self._coordinator_task = self._cleanup_task = self._late_task = None
+        self.answer = asyncio.get_running_loop().create_future()
         try:
-            self.rpc = await asyncio.to_thread(CodexRPC, mode="unix", client_name="homevoice", on_notify=notify)
+            runtime = self._runtime()
+            # Every acquired-resource operation is inside this exception boundary.
+            self.slot = runtime.ProjectSlot.for_project()
+            self.slot.acquire(require_previous_closed=True)
+            self.slot.assert_project_scope()
+            self.attempt = runtime.NativeAttempt(self.slot)
+            intent = self._persist_intent(runtime, sdp, device_binding)
+            loop = asyncio.get_running_loop()
+            def notify(method, params):
+                loop.call_soon_threadsafe(self._notification, method, params)
+            self.rpc = await asyncio.to_thread(runtime.rpc_factory, mode="unix", client_name="homevoice", on_notify=notify)
             account = await asyncio.to_thread(self.rpc.call, "account/read", {"refreshToken": False}, 5)
             if (account.get("account") or {}).get("type") != "chatgpt":
-                raise NativeUnavailable("Managed subscription authentication is required; no fallback")
-            await asyncio.to_thread(self.rpc.call, "thread/resume", {"threadId": THREAD, "excludeTurns": True}, 5)
-            params = start_parameters(THREAD, self.slot.nonce, sdp)
+                raise NativeUnavailable("Managed subscription required; no fallback")
+            await asyncio.to_thread(self.rpc.call, "thread/resume", {"threadId": runtime.thread, "excludeTurns": True}, 5)
+            params = start_parameters(runtime.thread, self.slot.nonce, sdp)
             deadline = loop.time() + 15
-            self._coordinator_task = asyncio.create_task(coordinator.submit_phone_offer(
-                self.attempt, self.rpc, params, deadline))
-            await asyncio.wait_for(asyncio.shield(self._coordinator_task), max(0, deadline-loop.time()))
-            await asyncio.wait_for(asyncio.shield(self.answer), max(0, deadline-loop.time()))
+            self._submission_possible = True
+            self._coordinator_task = asyncio.create_task(self._load_coordinator().submit_phone_offer(
+                self.attempt, self.rpc, params, deadline, authority=intent))
+            await asyncio.wait_for(asyncio.shield(self._coordinator_task), self._remaining(deadline))
+            await asyncio.wait_for(asyncio.shield(self.answer), self._remaining(deadline))
             self.timer = asyncio.create_task(self._limit())
             return {"callID": call_id, "sdp": self.answer.result(), "model": MODEL}
         except BaseException:
-            # Retain the observer after an uncertain submission so late Started is owned.
-            if self.attempt.start_requested:
+            task_pending = self._coordinator_task is not None and not self._coordinator_task.done()
+            submitted = self.attempt is not None and self.attempt.start_requested
+            if submitted or task_pending:
                 self._held = True
-                try: await self.close(call_id)
-                except Exception: pass
+                await self.close(call_id)
             else:
-                self.slot.release()
-                if self.rpc: self.rpc.close()
-                self.rpc = self.slot = self.attempt = None
-                self.call_id = None
+                self._refuse_before_submit()
             raise
+
+    def _refuse_before_submit(self):
+        """No start was submitted. A failed durability repair still retains the lock."""
+        self._held = True
+        if self.rpc: self.rpc.close()
+        self.rpc = None
+        try:
+            if self.slot is not None and self.slot.handle is not None and not self.slot.handle.closed:
+                self.slot.assert_owned()
+                self.slot.write("refused", setup_failed_before_submission=True)
+                self.slot.release()
+            self.call_id = self.slot = self.attempt = None
+            self._held = False
+        except Exception:
+            # Deliberate hold, not an unobserved leak or a false closed claim.
+            self._emit("call.error", "שמירת מצב החיבור נכשלה. נדרשת בדיקה במחשב.")
+
+    @staticmethod
+    def _remaining(deadline):
+        value = deadline - asyncio.get_running_loop().time()
+        if value <= 0: raise TimeoutError("Shared cleanup/startup deadline expired")
+        return value
 
     def _emit(self, kind, text=None):
         if self.publish:
@@ -162,7 +195,14 @@ class ManagedNativeHost:
             return
         try:
             if method == "thread/realtime/started":
-                if self.attempt.on_started(params): self._emit("call.started")
+                if self.attempt.on_started(params):
+                    self._emit("call.started")
+                    if self._cleanup_requested:
+                        self._held = True
+                        if self._cleanup_deadline <= asyncio.get_running_loop().time():
+                            self._emit("call.error", "התקבל חיבור מאוחר לאחר חלון הסגירה. נדרשת בדיקה במחשב.")
+                        elif self._late_task is None or self._late_task.done():
+                            self._late_task = asyncio.create_task(self.close(self.call_id))
             elif method == "thread/realtime/sdp":
                 if (not self.attempt.admitted or self.attempt.ownership_lost or self.answer.done()
                         or not str(params.get("sdp", "")).startswith("v=0")):
@@ -171,12 +211,12 @@ class ManagedNativeHost:
             elif method == "thread/realtime/closed":
                 if self.attempt.on_closed(params): self._emit("call.closed")
             elif method == "thread/realtime/error":
-                self.attempt.on_error(params)
-                self._held = True
+                self.attempt.on_error(params); self._held = True
                 self._emit("call.error", "השיחה נעצרה במחשב; נדרשת בדיקת החיבור.")
                 if not self.answer.done(): self.answer.set_exception(NativeUnavailable("Native voice refused"))
-            elif method == "thread/realtime/item/started": self._emit("agent.working")
-            elif method == "thread/realtime/item/completed": self._emit("agent.done")
+            elif method == "turn/started" and self.attempt.admitted: self._emit("agent.working")
+            elif method == "turn/completed" and self.attempt.admitted: self._emit("agent.done")
+            # Realtime transcript items are not evidence of backend work.
         except Exception:
             self._held = True
             self._emit("call.error", "בעלות החיבור השתנתה. לא תיעצר שיחה אחרת.")
@@ -185,29 +225,65 @@ class ManagedNativeHost:
         await asyncio.sleep(300)
         await self.close(self.call_id)
 
+    def _hold_cleanup(self):
+        self._held = True
+        if self.slot is not None:
+            try:
+                self.slot.assert_owned()
+                self.slot.write("native_uncertain", phone_cleanup_unresolved=True,
+                    native_closed_observed=bool(self.attempt and self.attempt.closed_event.is_set()),
+                    cleanup_deadline=self._cleanup_deadline,
+                    ownership_conflict=bool(self.attempt and self.attempt.ownership_lost))
+            except Exception:
+                self._emit("call.error", "לא ניתן לאשר שמירת מצב הסגירה; נדרשת בדיקה במחשב.")
+
     async def close(self, call_id):
-        if call_id != self.call_id or not self.attempt:
+        if call_id != self.call_id or self.attempt is None:
+            if call_id is not None and call_id == self._last_closed_call_id:
+                return True
             raise NativeUnavailable("Call identity does not belong to this frontend")
-        if self._closing:
-            raise NativeUnavailable("Close is already in progress")
-        self._closing = True
+        if self._cleanup_deadline is None:
+            self._cleanup_deadline = asyncio.get_running_loop().time() + self._cleanup_seconds
+        deadline = self._cleanup_deadline
+        self._cleanup_requested = True
+        self.attempt.closing = True
+        # Canonical on_started can now schedule owned late cleanup within THIS deadline.
+        self.attempt.cleanup_deadline = deadline
         try:
+            timeout = self._remaining(deadline)
+            await asyncio.wait_for(self._close_lock.acquire(), timeout)
+        except TimeoutError:
+            if call_id == self._last_closed_call_id:
+                return True
+            self._hold_cleanup()
+            return False
+        try:
+            if call_id != self.call_id or self.attempt is None:
+                return call_id == self._last_closed_call_id
+            if self._cleanup_task is None:
+                self._cleanup_task = asyncio.create_task(self.attempt.close(self.rpc, cleanup_deadline=deadline))
             if self._coordinator_task and not self._coordinator_task.done():
-                # Do not cancel a submitted start and lose its late-admission observer.
-                await asyncio.wait_for(asyncio.shield(self._coordinator_task), 15)
-            await self.attempt.close(self.rpc, wait_seconds=10)
+                await asyncio.wait_for(asyncio.shield(self._coordinator_task), self._remaining(deadline))
             if self.attempt.start_requested and not self.attempt.closed_event.is_set():
-                self._held = True
+                timeout = self._remaining(deadline)
+                await asyncio.wait_for(self.attempt.closed_event.wait(), timeout)
+            await asyncio.wait_for(asyncio.shield(self._cleanup_task), self._remaining(deadline))
+            if self.attempt.ownership_lost:
+                self._hold_cleanup()
                 return False
             self.slot.release()
             if self.timer and self.timer is not asyncio.current_task(): self.timer.cancel()
             if self.rpc: self.rpc.close()
-            self.call_id = None
-            self.rpc = self.slot = self.attempt = None
+            self._last_closed_call_id = call_id
+            self.call_id = self.rpc = self.slot = self.attempt = None
             self._held = False
             return True
         except Exception:
-            self._held = True
+            self._hold_cleanup()
+            # Observe task failures without losing a live late-admission observer.
+            if self._cleanup_task and self._cleanup_task.done():
+                try: self._cleanup_task.exception()
+                except asyncio.CancelledError: pass
             return False
         finally:
-            self._closing = False
+            self._close_lock.release()
