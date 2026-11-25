@@ -2,7 +2,7 @@ name: HomeVoice native app
 on:
   push:
     branches: [main]
-    paths: ['HomeVoice/**', 'HomeVoice.xcodeproj/**', 'homevoice/**', 'tests/**', 'Tests/HomeVoiceChecks.swift', 'scripts/homevoice-smoke.sh', '.github/workflows/homevoice.yml']
+    paths: ['HomeVoice/**', 'HomeVoice.xcodeproj/**', 'homevoice_broker/**', 'tests/**', 'Tests/HomeVoiceChecks.swift', 'scripts/homevoice-smoke.sh', '.github/workflows/homevoice.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,15 +15,19 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Record tools and check protocol
         run: |
           mkdir -p build
-          xcodebuild -version
+          set -o pipefail
+          xcodebuild -version | tee build/homevoice-tools.log
           swiftc HomeVoice/LiveProtocol.swift Tests/HomeVoiceChecks.swift -o build/homevoice-checks
           build/homevoice-checks
           python3 -m venv build/test-env
-          build/test-env/bin/pip install -r homevoice/requirements.txt
-          build/test-env/bin/python -m unittest discover -s tests -v
+          build/test-env/bin/pip install -r homevoice_broker/requirements.txt
+          build/test-env/bin/python -m unittest discover -s tests -v 2>&1 | tee build/homevoice-tests.log
       - name: Build native iPhone app
         run: |
           set -o pipefail

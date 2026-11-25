@@ -8,8 +8,8 @@ import asyncio
 import unittest
 import uuid
 from aiohttp.test_utils import TestClient, TestServer
-from homevoice.server import create_app
-from homevoice.native import start_parameters, ManagedNativeHost, NativeUnavailable
+from homevoice_broker.server import create_app
+from homevoice_broker.native import start_parameters, ManagedNativeHost, NativeUnavailable
 
 SECRET = 'offline-test-pairing-secret-with-no-real-access'
 

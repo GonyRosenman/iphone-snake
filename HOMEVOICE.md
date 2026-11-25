@@ -45,20 +45,20 @@ installation/audio are additional unverified steps.
 
 ```sh
 python3 -m venv .venv-homevoice
-.venv-homevoice/bin/pip install -r homevoice/requirements.txt
-.venv-homevoice/bin/python -m unittest discover -s tests -v
+.venv-homevoice_broker/bin/pip install -r homevoice_broker/requirements.txt
+.venv-homevoice_broker/bin/python -m unittest discover -s tests -v
 ```
 
 Tests use actual loopback HTTP/WebSocket connections with an explicit native
 service fixture. They do not call Codex, OpenAI, a microphone, or a shared slot.
 
 For a reviewed deployment, create a private config based on
-`homevoice/config.example.json`, a separate high-entropy device-pairing secret
+`homevoice_broker/config.example.json`, a separate high-entropy device-pairing secret
 file (0600), and the reviewed coordinator. Keep actual identities, keys and
 config outside Git. Start the broker manually:
 
 ```sh
-.venv-homevoice/bin/python -m homevoice.server --config /private/homevoice-config.json
+.venv-homevoice_broker/bin/python -m homevoice_broker.server --config /private/homevoice-config.json
 ```
 
 The CLI binds only to `127.0.0.1`; it changes no firewall or startup service.
