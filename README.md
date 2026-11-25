@@ -10,9 +10,13 @@ GitHub Actions uses the standard `macos-15` hosted runner and its installed Xcod
 On each push to `main` (or manual dispatch), it:
 
 1. Compiles and runs game logic checks.
-2. Builds the iPhone Simulator app, installs and launches it, and captures a screenshot.
-3. Compiles the native arm64 iPhone app with signing disabled.
-4. Uploads `TinySnake-unsigned.ipa`, SHA-256 checksum, build logs and simulator evidence for one day.
+2. Compiles the native arm64 iPhone app with signing disabled and uploads the unsigned IPA and SHA-256 checksum.
+3. Builds the iPhone Simulator app, then attempts installation, launch and a screenshot (five-minute launch-step limit).
+4. Uploads available build logs and simulator evidence for one day.
+
+The device IPA is uploaded before simulator startup, so a slow or failed simulator
+does not prevent access to an already successful native build. Check each run's
+individual steps and evidence before treating simulator launch as verified.
 
 The Actions run records its actual Xcode/SDK versions. Native compilation happens
 on the macOS runner. No Apple signing credentials are used by the workflow.
