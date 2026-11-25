@@ -39,6 +39,7 @@ final class VoicePeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelega
     private var track: RTCAudioTrack?
     var onEvent: (([String: Any]) -> Void)?
     var onFailure: (() -> Void)?
+    var onConnected: ((Bool) -> Void)?
     override init() {
         _ = Self.initialized
         factory = RTCPeerConnectionFactory()
@@ -99,6 +100,7 @@ final class VoicePeer: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDelega
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        onConnected?(newState == .connected || newState == .completed)
         if newState == .failed { onFailure?() }
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
@@ -122,6 +124,7 @@ final class VoiceModel: ObservableObject {
     @Published var homeConnected = false
     @Published var ready = false
     @Published var active = false
+    @Published var mediaConnected = false
     @Published var busy = false
     @Published var muted = false
     @Published var finishing = false
@@ -229,8 +232,17 @@ final class VoiceModel: ObservableObject {
             try audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try audio.setActive(true)
             let rtc = VoicePeer(); peer = rtc
-            rtc.onEvent = { [weak self] event in Task { @MainActor in self?.liveEvent(event) } }
-            rtc.onFailure = { [weak self] in Task { @MainActor in await self?.stop(); self?.message = "החיבור הקולי נותק." } }
+            rtc.onEvent = { [weak self] event in Task { @MainActor in
+                guard let self = self, self.epoch == attempt else { return }; self.liveEvent(event)
+            } }
+            rtc.onFailure = { [weak self] in Task { @MainActor in
+                guard let self = self, self.epoch == attempt else { return }; await self.stop(); self.message = "החיבור הקולי נותק."
+            } }
+            rtc.onConnected = { [weak self] connected in Task { @MainActor in
+                guard let self = self, self.epoch == attempt else { return }
+                self.mediaConnected = connected
+                if connected { self.message = "אפשר לדבר" }
+            } }
             let sdp = try await rtc.offer()
             guard epoch == attempt else { rtc.close(); return }
             callID = attempt.uuidString
@@ -279,7 +291,7 @@ final class VoiceModel: ObservableObject {
     private func cleanup() {
         epoch = UUID(); maxDuration?.cancel(); maxDuration = nil
         peer?.close(); peer = nil; callID = nil
-        active = false; muted = false; finishing = false; agentWorking = false
+        active = false; mediaConnected = false; muted = false; finishing = false; agentWorking = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
@@ -307,7 +319,7 @@ struct VoiceView: View {
                 Image(systemName: model.muted ? "mic.slash.fill" : "waveform")
                     .font(.system(size: 68, weight: .light)).foregroundStyle(.cyan)
             }
-            Text(model.active ? "אני מקשיב" : "הסוכן שלך, בקול").font(.title.bold())
+            Text(model.active ? (model.mediaConnected ? "אני מקשיב" : "מתחבר לשיחה") : "הסוכן שלך, בקול").font(.title.bold())
             Text(model.message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             if !model.userCaption.isEmpty || !model.agentCaption.isEmpty {
                 ScrollView {
