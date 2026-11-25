@@ -37,6 +37,7 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.start_tasks = []
         self.rpc_objects = []
         self.cleanup_entered = asyncio.Event()
+        self.submission_entered = asyncio.Event()
         self.fail_refusal = False
         self.loop = asyncio.get_running_loop()
         fixture = self
@@ -64,6 +65,8 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def call(self, method, params, timeout=10):
                 fixture.rpc_calls.append((method, params))
                 if method == 'account/read': return {'account': {'type': 'chatgpt'}}
+                if method == 'thread/realtime/start':
+                    fixture.loop.call_soon_threadsafe(fixture.submission_entered.set)
                 if method == 'thread/realtime/stop':
                     self.notify('thread/realtime/closed', {'threadId': fixture.thread})
                 return {}
@@ -74,6 +77,9 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                                       runtime_factory=lambda: self.runtime, cleanup_seconds=0.1)
         class Coordinator:
             def readiness(self, config): return {'ready': True}
+            def register_request(self, call_id, capability): pass
+            def forget_request(self, call_id): pass
+            def release_reference(self, config): return 'offline-fixture-reference'
             async def submit_phone_offer(self, attempt, rpc, params, deadline, *, authority):
                 await attempt.submit(rpc, params, startup_deadline=deadline,
                     observe_native=lambda thread, challenge: fixture.shared.NativeObservation(
@@ -160,6 +166,9 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         fixture = self
         class SlowCoordinator:
             def readiness(self, config): return {"ready": True}
+            def register_request(self, call_id, capability): pass
+            def forget_request(self, call_id): pass
+            def release_reference(self, config): return 'offline-fixture-reference'
             async def submit_phone_offer(self, attempt, rpc, params, deadline, *, authority):
                 await attempt.submit(rpc, params, startup_deadline=deadline,
                     observe_native=lambda thread, challenge: fixture.shared.NativeObservation(
@@ -168,8 +177,7 @@ class ManagedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.host.coordinator = SlowCoordinator()
         task = asyncio.create_task(self.start()); self.start_tasks.append(task)
         # Synchronize to the actual fixture RPC submission, without sleeps.
-        while not any(method == 'thread/realtime/start' for method, _ in self.rpc_calls):
-            await asyncio.sleep(0)
+        await asyncio.wait_for(self.submission_entered.wait(), 2)
         close = asyncio.create_task(self.host.close(self.call))
         await asyncio.wait_for(self.cleanup_entered.wait(), 2)
         deadline = self.host._cleanup_deadline

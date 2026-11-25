@@ -14,14 +14,15 @@ import ssl
 import uuid
 from aiohttp import web
 from .native import ManagedNativeHost, NativeUnavailable
+from .trusted import RequestRegistry, RootReleaseStore, TrustError
 
 
 class Broker:
-    def __init__(self, host):
-        self.host = host
-        self.current = None
+    def __init__(self, host, registry):
+        self.host, self.registry = host, registry
+        self.current = self.current_control = self.current_capability = None
         self.seen = set()
-        self.sockets = set()
+        self.sockets = {}
         self.lock = asyncio.Lock()
         self.operation_lock = asyncio.Lock()
         self.tasks = set()
@@ -29,8 +30,8 @@ class Broker:
     def publish(self, event):
         async def send():
             if event.get("type") in ("call.closed", "call.error") and event.get("callID") == self.current:
-                await self._close_current()
-            for ws in tuple(self.sockets):
+                await self._close_current(event.get("callID"))
+            for ws in tuple(self.sockets.values()):
                 if not ws.closed:
                     try: await ws.send_json(event)
                     except ConnectionError: pass
@@ -42,65 +43,83 @@ class Broker:
 
     async def start(self, request):
         data = await body(request)
-        identifier, sdp = data.get("callID"), data.get("sdp")
+        identifier, sdp, control_id = data.get("callID"), data.get("sdp"), data.get("controlID")
         try: uuid.UUID(identifier)
         except (ValueError, TypeError, AttributeError): raise web.HTTPBadRequest(text="Invalid call identity")
-        if set(data) != {"callID", "sdp"} or not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp.encode()) > 60000:
+        if set(data) != {"callID", "sdp", "controlID"} or not isinstance(control_id, str) or not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp.encode()) > 60000:
             raise web.HTTPBadRequest(text="Only a WebRTC offer and call identity are accepted")
         async with self.lock:
             if self.current or identifier in self.seen: raise web.HTTPConflict(text="Reconcile existing call; no replay")
-            if not any(not ws.closed for ws in self.sockets): raise web.HTTPConflict(text="Home control connection is required")
+            if not any(not ws.closed for ws in self.sockets.values()): raise web.HTTPConflict(text="Home control connection is required")
             if not self.host.status()["ready"]: raise web.HTTPServiceUnavailable(text="Native voice is not released")
-            self.current = identifier; self.seen.add(identifier)
+            try:
+                capability = self.registry.issue_request(request["auth_context"], identifier, sdp, control_id)
+            except TrustError:
+                raise web.HTTPConflict(text="Authenticated control connection changed")
+            self.current, self.current_control, self.current_capability = identifier, control_id, capability
+            self.seen.add(identifier)
         try:
             async with self.operation_lock:
-                if not any(not ws.closed for ws in self.sockets):
+                if not any(not ws.closed for ws in self.sockets.values()):
                     self.current = None
                     raise NativeUnavailable("Home control disconnected before admission")
-                result = await self.host.start(identifier, sdp, self.publish, device_binding=request["device_binding"])
+                result = await self.host.start(identifier, sdp, self.publish, device_binding=request["device_binding"],
+                                               request_capability=capability)
             # Native signaling is not a credential-export surface.
             if set(result) != {"callID", "sdp", "model"}:
                 raise NativeUnavailable("Unexpected signaling fields")
             return web.json_response(result, status=201, headers={"Cache-Control": "no-store"})
         except Exception:
             # No automatic retry. Keep current when admission/cleanup is uncertain.
-            if getattr(self.host, "call_id", None) is None: self.current = None
+            if getattr(self.host, "call_id", None) is None:
+                self.registry.revoke_request(capability)
+                self.current = self.current_control = self.current_capability = None
             raise web.HTTPServiceUnavailable(text="Voice could not start; inspect the home service")
 
     async def close(self, request):
         data = await body(request)
         if set(data) != {"callID"} or data.get("callID") != self.current or self.current is None:
             raise web.HTTPConflict(text="Call identity mismatch")
-        closed = await self._close_current()
+        # Revoke immediately; a serialized close must also cancel pending admission.
+        self.registry.revoke_request(self.current_capability)
+        closed = await self._close_current(data["callID"])
         return web.json_response({"closed": bool(closed)}, headers={"Cache-Control": "no-store"})
 
-    async def _close_current(self):
+    async def _close_current(self, expected_call=None):
         async with self.operation_lock:
             if self.current is None:
                 return True
+            if expected_call is not None and self.current != expected_call:
+                return False
             identifier = self.current
             closed = await self.host.close(identifier)
             if closed and self.current == identifier:
-                self.current = None
+                self.registry.revoke_request(self.current_capability)
+                self.current = self.current_control = self.current_capability = None
             return closed
 
     async def events(self, request):
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=4096)
         await ws.prepare(request)
-        self.sockets.add(ws)
+        control_id = self.registry.add_control(request["auth_context"], ws)
+        self.sockets[control_id] = ws
         try:
-            await ws.send_json({"type": "home.connected"})
+            await ws.send_json({"type": "home.connected", "connectionID": control_id})
             async for message in ws:
                 # Native audio/control events go directly to OpenAI/managed Codex.
                 # The phone cannot inject turn/start, provider URLs, thread IDs or commands.
                 if message.type == web.WSMsgType.TEXT:
                     if message.data != 'ping': await ws.close(code=1008, message=b"Unsupported command")
         finally:
-            self.sockets.discard(ws)
-            if not self.sockets and self.current:
-                try:
-                    await self._close_current()
-                except Exception: pass  # Host ledger retains unresolved ownership.
+            self.registry.revoke_control(control_id)
+            self.sockets.pop(control_id, None)
+            if self.current_control == control_id:
+                identifier = self.current
+                async def finish_owned():
+                    try: await self._close_current(identifier)
+                    except Exception: pass  # Retain unresolved canonical ledger.
+                task = asyncio.create_task(finish_owned())
+                self.tasks.add(task); task.add_done_callback(self.tasks.discard)
         return ws
 
     async def shutdown(self, app):
@@ -108,7 +127,7 @@ class Broker:
             try:
                 await self._close_current()
             except Exception: pass
-        for ws in tuple(self.sockets): await ws.close(code=1001)
+        for ws in tuple(self.sockets.values()): await ws.close(code=1001)
         if self.tasks: await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
 
 
@@ -119,17 +138,24 @@ async def body(request):
     return value
 
 
-def create_app(secret, host):
+def create_app(secret, host, *, release_store=None):
     if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", secret):
         raise ValueError("A separate 32+ character device pairing secret is required")
+    registry = RequestRegistry(hashlib.sha256(secret.encode()).hexdigest())
+    if isinstance(host, ManagedNativeHost):
+        host.bind_server(registry, release_store or RootReleaseStore(
+            host.config.get("root_release_file"), host.config.get("root_release_sha256")))
     @web.middleware
     async def authenticate(request, handler):
         if request.headers.get("Origin") or not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + secret):
             raise web.HTTPUnauthorized(text="Unauthorized")
-        request["device_binding"] = hashlib.sha256(secret.encode()).hexdigest()
-        return await handler(request)
+        request["device_binding"] = registry.device_binding
+        context = registry.authenticated()
+        request["auth_context"] = context
+        try: return await handler(request)
+        finally: registry.finish_auth(context)
     app = web.Application(middlewares=[authenticate], client_max_size=65536)
-    broker = Broker(host)
+    broker = Broker(host, registry)
     app[web.AppKey("broker", Broker)] = broker
     app.router.add_get('/v1/status', broker.status)
     app.router.add_get('/v1/events', broker.events)

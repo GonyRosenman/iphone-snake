@@ -134,6 +134,7 @@ final class VoiceModel: ObservableObject {
     @Published var showSettings = false
     private var peer: VoicePeer?
     private var callID: String?
+    private var controlID: String?
     private var socket: URLSessionWebSocketTask?
     private var socketReader: Task<Void, Never>?
     private var maxDuration: Task<Void, Never>?
@@ -182,7 +183,7 @@ final class VoiceModel: ObservableObject {
             let status: HomeStatus = try await fetch("v1/status")
             try PairingSecret.save(secret)
             UserDefaults.standard.set(home, forKey: "homevoice.address")
-            homeConnected = false; ready = status.ready; message = status.message
+            homeConnected = false; controlID = nil; ready = status.ready; message = status.message
             try openControl()
             showSettings = false
         } catch { homeConnected = false; ready = false; message = error.localizedDescription }
@@ -205,14 +206,18 @@ final class VoiceModel: ObservableObject {
                 }
             } catch {
                 guard !Task.isCancelled else { return }
-                self?.homeConnected = false; self?.ready = false
+                self?.homeConnected = false; self?.ready = false; self?.controlID = nil
                 if self?.active == true { await self?.stop() }
                 self?.message = "החיבור לבית נותק. חבר מחדש כדי להמשיך."
             }
         }
     }
     private func control(_ event: HomeEvent) {
-        if event.type == "home.connected" { homeConnected = true; if ready { message = "המחשב מוכן לשיחה" }; return }
+        if event.type == "home.connected" {
+            guard let identifier = event.connectionID else { return }
+            controlID = identifier; homeConnected = true
+            if ready { message = "המחשב מוכן לשיחה" }; return
+        }
         guard event.callID == nil || event.callID == callID else { return }
         if event.type == "call.closed" { cleanup(); message = "השיחה הסתיימה" }
         if event.type == "call.error" { cleanup(); ready = false; message = event.text ?? "השיחה נעצרה במחשב." }
@@ -220,7 +225,7 @@ final class VoiceModel: ObservableObject {
         if event.type == "agent.done" { agentWorking = false }
     }
     func start() async {
-        guard homeConnected, ready, !busy, !active, !demo else { return }
+        guard homeConnected, ready, let controlID = controlID, !busy, !active, !demo else { return }
         busy = true; let attempt = UUID(); epoch = attempt
         message = "מכין שיחה…"
         defer { busy = false }
@@ -246,7 +251,7 @@ final class VoiceModel: ObservableObject {
             let sdp = try await rtc.offer()
             guard epoch == attempt else { rtc.close(); return }
             callID = attempt.uuidString
-            let answer: CallAnswer = try await fetch("v1/calls", body: ["callID": attempt.uuidString, "sdp": sdp])
+            let answer: CallAnswer = try await fetch("v1/calls", body: ["callID": attempt.uuidString, "sdp": sdp, "controlID": controlID])
             guard epoch == attempt else { return }
             guard answer.callID == attempt.uuidString, answer.model == "gpt-live-1.1-codex" else {
                 throw VoiceError.message("המחשב החזיר חיבור קולי לא צפוי.")

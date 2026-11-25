@@ -1,8 +1,8 @@
-# Phone admission contract proposal — source only
+# Phone admission contract — source only
 
-This document and `intent.py` prepare a reviewable operation. They grant no
-runtime authority. The canonical lifecycle source remains owned by its existing
-custodian; no shared API extension is implemented here.
+This code integrates the custodian-reviewed canonical phone authority API. It
+grants no runtime authority. Canonical lifecycle source remains owned by its
+existing custodian and is imported in place; it is not copied or edited here.
 
 ## Identity and custody
 
@@ -19,7 +19,7 @@ stopping another thread or an observed foreign session.
 
 `POST /v1/calls` checks the separate device-pairing bearer before native work and
 requires an active authenticated home-control channel. The request contains only
-a fresh call UUID and an SDP offer. The iPhone sends it after Start is tapped.
+a fresh call UUID, an SDP offer and the server-issued `controlID`. The iPhone sends it after Start is tapped.
 A bearer authenticates the paired client; it is not cryptographic proof of a
 physical tap. Runtime qualification must verify that UI behavior on the device.
 
@@ -39,29 +39,53 @@ of extra fields. Its return value is a content digest, not a grant. A coordinato
 must independently verify the actual owner instruction and current runtime
 custody release, not accept an arbitrary matching string as approval.
 
-## Proposed coordinator API
+## Trusted capability and coordinator
 
-A locally configured, hash-pinned coordinator exports:
+After constant-time pairing authentication, server middleware creates an opaque
+`AuthContext`. The authenticated WebSocket gets a random connection ID. The POST
+handler mints an identity-based `RequestCapability` bound to that actual HTTP
+context, call UUID, device fingerprint, offer SHA-256 and live control connection.
+No intent fields, claimed fingerprint, arbitrary constructed capability or JSON
+object can recreate registry membership. Request authority expires after thirty
+seconds and is revoked on control loss. The paired-client credential is separate
+from all provider/account credentials. It does not prove a physical tap.
 
-```python
-def readiness(config) -> dict:
-    # Read-only custody/config qualification. Never start voice as a probe.
-    return {"ready": False}
+The built-in `PhoneCoordinator` implements the canonical abstract root verifier.
+It verifies the actual registry entry against the canonical binding and requires
+explicit root-issued custody state selected by trusted private configuration.
+`RootReleaseStore` does not create production releases. Its absent/default state
+denies readiness. A release is a hash-pinned, private regular JSON file in a
+private directory. It binds owner reference, frontend, saved thread, exact model,
+device fingerprint, explicit possible same-thread retirement, time window,
+release identity and at most one operation. Hashing an invented manifest is not
+a grant: its publisher/selection remains the runtime custodian's responsibility.
 
-async def submit_phone_offer(attempt, rpc, params, startup_deadline, *, authority):
-    # Validate exact authority against the held canonical slot and durable intent.
-    # Refuse if closing, deadline expired, custody missing or previous work unresolved.
-    # Consume one reviewed, operation-bound authority before the one native submission.
-    # Use the reviewed CANONICAL API extension, not a copied lifecycle or raw-RPC bypass.
-    raise NotImplementedError("Canonical phone authority extension requires custodian review")
-```
+The verifier exclusively fsyncs a release-consumption record containing the
+complete canonical binding, intent digest and actual request-evidence digest.
+It rechecks current release and control state, then returns the exact canonical
+`VerifiedPhoneOperation` with fresh challenge and a monotonic validity deadline
+bounded by startup, request and release expiry. No default runtime release or
+production release-creation CLI is supplied. Failed/partial consumption stays
+spent; it is never removed or retried automatically.
 
-The exact canonical extension shape is a shared-owner decision. It should accept
-a structured one-operation authority or fresh authoritative empty-slot
-observation. Do not pass a historic one-probe retirement reference, fabricate a
-`NativeObservation`, clear a prior intent, or label `thread/read` a vacancy check.
-No implicit account/model/key fallback, retry, provider spend or public exposure
-is added. `enabled` remains false while this extension/release is unresolved.
+Canonical `NativeAttempt.submit(phone_authority=...,
+authority_verifier=...)` independently validates the persisted raw intent/ledger,
+exact thread/model/both nonce IDs/SDP and proof. It consumes its own exclusive
+call-UUID receipt before one native submission. UUID spelling is preserved for
+correlation; replay receipt filenames normalize UUID case. No legacy retirement
+reference, fabricated empty observation or raw-start bypass is used.
+
+At the actual RPC dispatch boundary, the coordinator rechecks the complete native
+parameters, current root release and actual request/control authority. Observed
+revocation or disconnect before dispatch refuses submission. Native work already
+dispatched follows canonical owned cleanup. A concurrent revocation cannot recall
+an already dispatched operation; physical connectivity and device behavior still
+require runtime qualification.
+
+Pin both canonical `voice_ownership.py` and `phone_operation_authority.py`, plus
+built-in coordinator/trusted-registry sources. The real configuration stays
+`enabled=false`; no private source pins or custody releases are refreshed by
+source integration or tests. No provider fallback, retry or public exposure.
 
 ## Lifecycle and return path
 

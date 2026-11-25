@@ -5,11 +5,9 @@ no RPC, starts no provider session, and acquires no shared lock.
 """
 import asyncio
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import sys
-import time
 
 MODEL = "gpt-live-1.1-codex"
 
@@ -58,6 +56,7 @@ class ManagedNativeHost:
         self._held = False
         self._submission_possible = False
         self._last_closed_call_id = None
+        self.request_registry = self.release_store = None
 
     def status(self):
         if self._held:
@@ -73,18 +72,22 @@ class ManagedNativeHost:
             return {"ready": False, "message": "הגדרת החיבור הקולי במחשב דורשת בדיקה."}
         return {"ready": True, "message": "המחשב מוכן לשיחה"}
 
+    def bind_server(self, registry, release_store):
+        if self.call_id is not None: raise NativeUnavailable("Cannot replace active server trust")
+        self.request_registry, self.release_store = registry, release_store
+
     def _load_coordinator(self):
         if self.coordinator is not None:
             return self.coordinator
-        path = Path(self.config["coordinator_file"])
-        if hashlib.sha256(path.read_bytes()).hexdigest() != self.config["coordinator_sha256"]:
-            raise NativeUnavailable("Reviewed coordinator identity is unavailable")
-        spec = importlib.util.spec_from_file_location("homevoice_reviewed_coordinator", path)
-        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-        if not callable(getattr(module, "readiness", None)) or not callable(getattr(module, "submit_phone_offer", None)):
-            raise NativeUnavailable("Coordinator contract is unavailable")
-        self.coordinator = module
-        return module
+        if self.request_registry is None or self.release_store is None:
+            raise NativeUnavailable("Trusted server request registry is not bound")
+        for filename, field in [("coordinator.py", "coordinator_sha256"), ("trusted.py", "trusted_registry_sha256")]:
+            path = Path(__file__).with_name(filename)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != self.config.get(field):
+                raise NativeUnavailable("Reviewed coordinator/request registry source changed")
+        from .coordinator import PhoneCoordinator
+        self.coordinator = PhoneCoordinator(self._runtime().phone_api, self.request_registry, self.release_store)
+        return self.coordinator
 
     def _runtime(self):
         if self._runtime_factory:
@@ -92,24 +95,30 @@ class ManagedNativeHost:
         from types import SimpleNamespace
         shared = Path(self.config["shared_voice_directory"]).resolve()
         lifecycle = shared / "voice_ownership.py"
-        if hashlib.sha256(lifecycle.read_bytes()).hexdigest() != self.config["lifecycle_sha256"]:
-            raise NativeUnavailable("Shared lifecycle changed; reconcile before admission")
+        phone_authority = shared / "phone_operation_authority.py"
+        for path, field in [(lifecycle, "lifecycle_sha256"), (phone_authority, "phone_authority_sha256")]:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != self.config.get(field):
+                raise NativeUnavailable("Reviewed canonical phone API source changed")
         sys.path.insert(0, str(shared))
         import voice_ownership
+        import phone_operation_authority
         from delegation_contract import THREAD
-        if Path(voice_ownership.__file__).resolve() != lifecycle.resolve() or THREAD != self.config["thread_id"]:
+        if (Path(voice_ownership.__file__).resolve() != lifecycle.resolve()
+                or Path(phone_operation_authority.__file__).resolve() != phone_authority.resolve()
+                or THREAD != self.config["thread_id"]):
             raise NativeUnavailable("Canonical lifecycle/backing identity changed")
         sys.path.insert(0, str(Path(self.config["peerbridge_directory"]).resolve()))
         from cxrpc import CodexRPC
         return SimpleNamespace(ProjectSlot=voice_ownership.ProjectSlot, NativeAttempt=voice_ownership.NativeAttempt,
-                               rpc_factory=CodexRPC, thread=THREAD, fsync_directory=voice_ownership.fsync_directory)
+                               rpc_factory=CodexRPC, thread=THREAD, fsync_directory=voice_ownership.fsync_directory,
+                               phone_api=phone_operation_authority)
 
     def _persist_intent(self, runtime, sdp, device_binding):
         from .intent import make_intent, encode_intent
         import os
         intent = make_intent(call_id=self.call_id, nonce=self.slot.nonce, thread=runtime.thread,
                              sdp=sdp, device_binding=device_binding,
-                             release_ref=self.config.get("runtime_release_ref"))
+                             release_ref=self._load_coordinator().release_reference(self.config))
         payload = encode_intent(intent)
         path = self.slot.directory / ("phone-intent-" + self.slot.nonce + ".json")
         with path.open("xb") as stream:
@@ -119,7 +128,7 @@ class ManagedNativeHost:
                         phone_intent_sha256=hashlib.sha256(payload).hexdigest())
         return intent
 
-    async def start(self, call_id, sdp, publish, *, device_binding):
+    async def start(self, call_id, sdp, publish, *, device_binding, request_capability=None):
         if self.call_id or self._held:
             raise NativeUnavailable("Voice slot is occupied or unresolved")
         if not self.status()["ready"]:
@@ -130,6 +139,7 @@ class ManagedNativeHost:
         self._coordinator_task = self._cleanup_task = self._late_task = None
         self.answer = asyncio.get_running_loop().create_future()
         try:
+            self._load_coordinator().register_request(call_id, request_capability)
             runtime = self._runtime()
             # Every acquired-resource operation is inside this exception boundary.
             self.slot = runtime.ProjectSlot.for_project()
@@ -174,6 +184,7 @@ class ManagedNativeHost:
                 self.slot.assert_owned()
                 self.slot.write("refused", setup_failed_before_submission=True)
                 self.slot.release()
+            self._load_coordinator().forget_request(self.call_id)
             self.call_id = self.slot = self.attempt = None
             self._held = False
         except Exception:
@@ -274,6 +285,7 @@ class ManagedNativeHost:
             self.slot.release()
             if self.timer and self.timer is not asyncio.current_task(): self.timer.cancel()
             if self.rpc: self.rpc.close()
+            self._load_coordinator().forget_request(call_id)
             self._last_closed_call_id = call_id
             self.call_id = self.rpc = self.slot = self.attempt = None
             self._held = False

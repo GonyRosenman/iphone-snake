@@ -32,21 +32,33 @@ The application is not a claim of a completed phone call. Native admission
 and real phone audio must be qualified separately from compilation, simulator
 rendering and offline HTTP tests.
 
-The broker is **disabled by default**. A reviewed local coordinator must supply
-`readiness(config)` and async `submit_phone_offer(attempt, rpc, params,
-startup_deadline, authority=...)` before native admission can run. The coordinator owns the
-fresh shared-slot admission decision. This code never borrows an old probe's
-retirement grant, calls `thread/read` an empty-slot oracle, or starts another
-backing thread. The existing runtime custodian must review and release this
-integration. Private home HTTPS reachability, pairing and physical iPhone
-installation/audio are additional unverified steps.
+The broker is **disabled by default**. Its built-in coordinator creates no
+runtime authority. Pairing middleware mints an opaque in-process request
+capability after authentication; it binds the exact call, SDP and authenticated
+control connection. A disconnected control channel cannot authorize a start.
+The phone includes its server-issued `controlID` with the offer.
+
+Admission also requires explicit current root-issued private custody state,
+whose file and SHA-256 must be selected by the existing runtime custodian.
+Missing, disabled, expired, changed or consumed release state denies admission.
+One release authorizes at most one attempt. This repository contains no production
+release. Configuring matching strings does not prove an owner grant or physical tap.
+
+The coordinator implements the reviewed canonical `RootPhoneAuthorityVerifier`
+interface and uses `NativeAttempt.submit(phone_authority=...,
+authority_verifier=...)`. Both canonical modules and the built-in coordinator
+and request registry require reviewed source hashes. The phone cannot supply
+a verifier. No old probe retirement reference or empty-slot observation is used.
+The shared runtime custodian still must review and release deployment. Private
+home HTTPS reachability, pairing and physical iPhone installation/audio remain
+unverified.
 
 ## Local development
 
 ```sh
 python3 -m venv .venv-homevoice
-.venv-homevoice_broker/bin/pip install -r homevoice_broker/requirements.txt
-.venv-homevoice_broker/bin/python -m unittest discover -s tests -v
+.venv-homevoice/bin/pip install -r homevoice_broker/requirements.txt
+.venv-homevoice/bin/python -m unittest discover -s tests -v
 ```
 
 Tests use actual loopback HTTP/WebSocket connections with an explicit native
@@ -54,11 +66,11 @@ service fixture. They do not call Codex, OpenAI, a microphone, or a shared slot.
 
 For a reviewed deployment, create a private config based on
 `homevoice_broker/config.example.json`, a separate high-entropy device-pairing secret
-file (0600), and the reviewed coordinator. Keep actual identities, keys and
+file (0600), and the root-reviewed source pins/custody release. Keep actual identities, keys and
 config outside Git. Start the broker manually:
 
 ```sh
-.venv-homevoice_broker/bin/python -m homevoice_broker.server --config /private/homevoice-config.json
+.venv-homevoice/bin/python -m homevoice_broker.server --config /private/homevoice-config.json
 ```
 
 The CLI binds only to `127.0.0.1`; it changes no firewall or startup service.
@@ -92,8 +104,8 @@ contract is a different transport from the managed native route implemented here
 ## Shared admission review contract
 
 See [the concrete phone-intent proposal](homevoice_broker/ADMISSION_CONTRACT.md).
-This is source/contract work; it does not extend the canonical lifecycle API or
-release the existing native session slot.
+This integrates the existing reviewed canonical phone API as source only. It
+does not release the existing native session slot.
 
 Optional tests against the existing canonical lifecycle source:
 

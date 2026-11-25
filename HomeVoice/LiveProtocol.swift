@@ -13,6 +13,7 @@ struct HomeEvent: Decodable {
     let type: String
     let callID: String?
     let text: String?
+    let connectionID: String?
 }
 
 enum VoiceError: LocalizedError {

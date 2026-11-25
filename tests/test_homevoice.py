@@ -20,7 +20,7 @@ class FixtureHost:
         self.stops = []
         self.confirm_close = True
     def status(self): return {"ready": True, "message": "offline fixture"}
-    async def start(self, call_id, sdp, publish, *, device_binding):
+    async def start(self, call_id, sdp, publish, *, device_binding, request_capability=None):
         self.starts += 1; self.call_id = call_id; self.publish = publish
         return {"callID": call_id, "sdp": "v=0\r\no=offline-answer", "model": "gpt-live-1.1-codex"}
     async def close(self, call_id):
@@ -35,13 +35,16 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
         self.headers = {'Authorization': 'Bearer '+SECRET}
         self.ws = None
+        self.control_id = str(uuid.uuid4())
     async def asyncTearDown(self):
         if self.ws: await self.ws.close()
         await self.client.close()
     async def control(self):
         self.ws = await self.client.ws_connect('/v1/events', headers=self.headers)
-        self.assertEqual((await self.ws.receive_json())['type'], 'home.connected')
-    def offer(self): return {'callID': str(uuid.uuid4()), 'sdp': 'v=0\r\no=offline-offer'}
+        hello = await self.ws.receive_json()
+        self.assertEqual(hello['type'], 'home.connected')
+        self.control_id = hello['connectionID']
+    def offer(self): return {'callID': str(uuid.uuid4()), 'sdp': 'v=0\r\no=offline-offer', 'controlID': self.control_id}
     async def test_auth_and_origin_precede_native_operations(self):
         for headers in [{}, {'Authorization': 'Bearer wrong'}, dict(self.headers, Origin='https://other.example')]:
             response = await self.client.post('/v1/calls', json=self.offer(), headers=headers)
@@ -122,17 +125,17 @@ class ConcurrentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         class SlowHost(FixtureHost):
             def __init__(self):
                 super().__init__(); self.entered = asyncio.Event(); self.release = asyncio.Event()
-            async def start(self, call_id, sdp, publish, *, device_binding):
+            async def start(self, call_id, sdp, publish, *, device_binding, request_capability=None):
                 self.entered.set(); await self.release.wait()
-                return await super().start(call_id, sdp, publish, device_binding=device_binding)
+                return await super().start(call_id, sdp, publish, device_binding=device_binding, request_capability=request_capability)
         host = SlowHost()
         client = TestClient(TestServer(create_app(SECRET, host)))
         await client.start_server()
         headers = {'Authorization': 'Bearer '+SECRET}
         ws = await client.ws_connect('/v1/events', headers=headers)
-        await ws.receive_json()
+        control_id = (await ws.receive_json())['connectionID']
         identifier = str(uuid.uuid4())
-        start = asyncio.create_task(client.post('/v1/calls', json={'callID': identifier, 'sdp': 'v=0'}, headers=headers))
+        start = asyncio.create_task(client.post('/v1/calls', json={'callID': identifier, 'sdp': 'v=0', 'controlID': control_id}, headers=headers))
         await host.entered.wait()
         close = asyncio.create_task(client.post('/v1/calls/close', json={'callID': identifier}, headers=headers))
         await asyncio.sleep(0)
